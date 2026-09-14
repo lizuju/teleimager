@@ -1196,6 +1196,226 @@ class OpenCVCamera(BaseCamera):
         self.cap = None
         logger_mp.info(f"[OpenCVCamera] Released {self._cam_topic}")
 
+class OpenCVStereoCamera(BaseCamera):
+    EYE_SHAPE = (480, 640)
+    CAPTURE_FPS = 30
+
+    def __init__(self, cam_topic, left_video_path, right_video_path, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
+        if tuple(img_shape) != (480, 1280) or fps != self.CAPTURE_FPS:
+            raise ValueError("[OpenCVStereoCamera] image_shape must be [480, 1280] and fps must be 30")
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        self._left_video_path = left_video_path
+        self._right_video_path = right_video_path
+
+        self.left_cap = cv2.VideoCapture(self._left_video_path, cv2.CAP_V4L2)
+        self.right_cap = cv2.VideoCapture(self._right_video_path, cv2.CAP_V4L2)
+        for cap in (self.left_cap, self.right_cap):
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.EYE_SHAPE[0])
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.EYE_SHAPE[1])
+            cap.set(cv2.CAP_PROP_FPS, self.CAPTURE_FPS)
+            if not cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
+                logger_mp.info(f"[OpenCVStereoCamera: {cam_topic}] CAP_PROP_BUFFERSIZE=1 not supported by backend")
+
+        if not self.left_cap.isOpened() or not self.right_cap.isOpened():
+            self.release()
+            raise RuntimeError(f"[OpenCVStereoCamera] Camera {self._cam_topic} failed to initialize")
+        logger_mp.info(str(self))
+
+    def __str__(self):
+        return (
+            f"[OpenCVStereoCamera: {self._cam_topic}] initialized with two "
+            f"{self.EYE_SHAPE[0]}x{self.EYE_SHAPE[1]} MJPEG cameras @ {self.CAPTURE_FPS} FPS.\n"
+            f"ZMQ: {'enabled, zmq port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+
+    def _update_frame(self):
+        left_grabbed = self.left_cap.grab()
+        right_grabbed = self.right_cap.grab()
+        if not left_grabbed or not right_grabbed:
+            raise RuntimeError(f"[OpenCVStereoCamera] Failed to grab synchronized frames from {self._cam_topic}")
+
+        left_ok, left_frame = self.left_cap.retrieve()
+        right_ok, right_frame = self.right_cap.retrieve()
+        if not left_ok or not right_ok:
+            raise RuntimeError(f"[OpenCVStereoCamera] Failed to retrieve synchronized frames from {self._cam_topic}")
+
+        stereo_frame = np.concatenate((left_frame, right_frame), axis=1)
+
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(stereo_frame)
+        if self._enable_zmq:
+            ok, buf = cv2.imencode(".jpg", stereo_frame)
+            if ok:
+                self._zmq_buffer.write(buf.tobytes())
+        if not self._ready.is_set():
+            self._ready.set()
+
+    def release(self):
+        for cap in (getattr(self, "left_cap", None), getattr(self, "right_cap", None)):
+            if cap is not None:
+                cap.release()
+        self.left_cap = None
+        self.right_cap = None
+        logger_mp.info(f"[OpenCVStereoCamera] Released {self._cam_topic}")
+
+class RtpH264Camera(BaseCamera):
+    def __init__(self, cam_topic, rtp_port, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666,
+                 webrtc_codec=None, rotate="clockwise"):
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        self._rtp_port = int(rtp_port)
+        self._jpeg_buffer = bytearray()
+        self._process = subprocess.Popen(
+            [
+                "gst-launch-1.0", "-q",
+                "udpsrc", f"port={self._rtp_port}",
+                "caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96",
+                "!", "rtph264depay", "!", "h264parse", "!", "avdec_h264", "!",
+                "videoflip", f"method={rotate}", "!", "videoconvert", "!",
+                "jpegenc", "quality=85", "!", "fdsink", "fd=1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        logger_mp.info(str(self))
+
+    def __str__(self):
+        return (
+            f"[RtpH264Camera: {self._cam_topic}] listening on UDP {self._rtp_port}, "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
+            f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+
+    def _read_jpeg(self):
+        while True:
+            start = self._jpeg_buffer.find(b"\xff\xd8")
+            if start >= 0:
+                end = self._jpeg_buffer.find(b"\xff\xd9", start + 2)
+                if end >= 0:
+                    frame = bytes(self._jpeg_buffer[start:end + 2])
+                    del self._jpeg_buffer[:end + 2]
+                    return frame
+                if start:
+                    del self._jpeg_buffer[:start]
+            elif len(self._jpeg_buffer) > 1:
+                del self._jpeg_buffer[:-1]
+
+            chunk = self._process.stdout.read(4096)
+            if not chunk:
+                raise RuntimeError(f"[RtpH264Camera] GStreamer exited on UDP {self._rtp_port}")
+            self._jpeg_buffer.extend(chunk)
+
+    def _update_frame(self):
+        jpeg_bytes = self._read_jpeg()
+        bgr_numpy = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if bgr_numpy is None:
+            raise RuntimeError(f"[RtpH264Camera] Failed to decode JPEG on UDP {self._rtp_port}")
+
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(bgr_numpy)
+        if self._enable_zmq:
+            self._zmq_buffer.write(jpeg_bytes)
+        if not self._ready.is_set():
+            self._ready.set()
+
+    def release(self):
+        process = getattr(self, "_process", None)
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+            self._process = None
+        logger_mp.info(f"[RtpH264Camera] Released {self._cam_topic}")
+
+class RtpH264StereoCamera(BaseCamera):
+    def __init__(self, cam_topic, left_rtp_port, right_rtp_port, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666,
+                 webrtc_codec=None):
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+        self._processes = []
+        self._jpeg_buffers = [bytearray(), bytearray()]
+        for port in (left_rtp_port, right_rtp_port):
+            self._processes.append(subprocess.Popen(
+                [
+                    "gst-launch-1.0", "-q", "udpsrc", f"port={int(port)}",
+                    "caps=application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96",
+                    "!", "rtph264depay", "!", "h264parse", "!", "avdec_h264", "!",
+                    "videoconvert", "!", "jpegenc", "quality=85", "!", "fdsink", "fd=1",
+                ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0
+            ))
+        logger_mp.info(str(self))
+
+    def __str__(self):
+        return (
+            f"[RtpH264StereoCamera: {self._cam_topic}] listening on UDP 5002/5003, "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
+            f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+        )
+
+    def _read_jpeg(self, index):
+        buffer = self._jpeg_buffers[index]
+        process = self._processes[index]
+        while True:
+            start = buffer.find(b"\xff\xd8")
+            if start >= 0:
+                end = buffer.find(b"\xff\xd9", start + 2)
+                if end >= 0:
+                    frame = bytes(buffer[start:end + 2])
+                    del buffer[:end + 2]
+                    return frame
+                if start:
+                    del buffer[:start]
+            elif len(buffer) > 1:
+                del buffer[:-1]
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                raise RuntimeError(f"[RtpH264StereoCamera] GStreamer exited for eye {index}")
+            buffer.extend(chunk)
+
+    def _update_frame(self):
+        frames = []
+        for index in range(2):
+            jpeg_bytes = self._read_jpeg(index)
+            frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise RuntimeError(f"[RtpH264StereoCamera] Failed to decode eye {index}")
+            frames.append(frame)
+        frame_data = cv2.hconcat(frames)
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(frame_data)
+        if self._enable_zmq:
+            ok, encoded = cv2.imencode(".jpg", frame_data)
+            if ok:
+                self._zmq_buffer.write(encoded.tobytes())
+        if not self._ready.is_set():
+            self._ready.set()
+
+    def release(self):
+        for process in self._processes:
+            try:
+                process.terminate()
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+        self._processes = []
+        logger_mp.info(f"[RtpH264StereoCamera] Released {self._cam_topic}")
+
 class IsaacSimCamera(BaseCamera):
     def __init__(self, cam_topic, img_shape, fps,
                  enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
@@ -1289,8 +1509,15 @@ class ImageServer:
         self._isaacsim_enable = isaacsim_enable
         self._stop_event = threading.Event()
         self._cameras: dict[str, BaseCamera] = {}
-        if not self._isaacsim_enable:
+        needs_camera_finder = any(
+            (cfg.get("enable_zmq", False) or cfg.get("enable_webrtc", False))
+            and cfg.get("type", "uvc").lower() in {"opencv", "opencv_stereo", "realsense", "uvc"}
+            for cfg in self._cam_config.values()
+        )
+        if not self._isaacsim_enable and needs_camera_finder:
             self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
+        else:
+            self._cam_finder = None
         self._responser = ZMQ_Responser(self._cam_config)
         self._zmq_publisher_manager = ZMQ_PublisherManager.get_instance()
         self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
@@ -1315,9 +1542,38 @@ class ImageServer:
                 video_id = cam_cfg.get("video_id", "0")
                 video_path = f"/dev/video{video_id}" if video_id else None
                 physical_path = str(cam_cfg.get("physical_path")) if cam_cfg.get("physical_path") else None
+                left_physical_path = str(cam_cfg.get("left_physical_path")) if cam_cfg.get("left_physical_path") else None
+                right_physical_path = str(cam_cfg.get("right_physical_path")) if cam_cfg.get("right_physical_path") else None
                 serial_number = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
 
-                if cam_type == "opencv":
+                if cam_type == "rtp_h264_stereo":
+                    self._cameras[cam_topic] = RtpH264StereoCamera(
+                        cam_topic,
+                        cam_cfg.get("left_rtp_port", 5002),
+                        cam_cfg.get("right_rtp_port", 5003),
+                        img_shape,
+                        fps,
+                        enable_zmq,
+                        zmq_port,
+                        enable_webrtc,
+                        webrtc_port,
+                        webrtc_codec,
+                    )
+                elif cam_type == "rtp_h264":
+                    self._cameras[cam_topic] = RtpH264Camera(
+                        cam_topic,
+                        cam_cfg.get("rtp_port", 5001),
+                        img_shape,
+                        fps,
+                        enable_zmq,
+                        zmq_port,
+                        enable_webrtc,
+                        webrtc_port,
+                        webrtc_codec,
+                        cam_cfg.get("rotate", "clockwise"),
+                    )
+
+                elif cam_type == "opencv":
                     if physical_path is not None:
                         vpath = self._cam_finder.get_vpath_by_ppath(physical_path)
                         if vpath is None:
@@ -1347,6 +1603,21 @@ class ImageServer:
                         self._cameras[cam_topic] = OpenCVCamera(cam_topic, video_path, img_shape, fps,
                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
                         
+
+                elif cam_type == "opencv_stereo":
+                    left_vpath = self._cam_finder.get_vpath_by_ppath(left_physical_path) if left_physical_path else None
+                    right_vpath = self._cam_finder.get_vpath_by_ppath(right_physical_path) if right_physical_path else None
+                    if left_vpath is None or right_vpath is None:
+                        self._cameras[cam_topic] = None
+                        logger_mp.error(
+                            f"[Image Server] Cannot find OpenCVStereoCamera for {cam_topic} with physical paths "
+                            f"{left_physical_path}, {right_physical_path}"
+                        )
+                    else:
+                        self._cameras[cam_topic] = OpenCVStereoCamera(
+                            cam_topic, left_vpath, right_vpath, img_shape, fps,
+                            enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                        )
 
                 elif cam_type == "realsense":
                     if not self._realsense_enable:

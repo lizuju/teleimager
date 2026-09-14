@@ -5,9 +5,9 @@
 # =====================================================
 webrtc:
   bitrate:
-    min: 2000000      # floor under congestion
-    default: 5000000  # startup rate, skips slow-start
-    max: 12000000     # quality ceiling on healthy network
+    min: 1000000
+    default: 3000000
+    max: 6000000
   gop_length: 60      # frames between keyframes; lower = faster recovery from packet loss
 
 # =====================================================
@@ -33,14 +33,16 @@ head_camera:
   #   - "opencv"    → opencv driver
   #   - "realsense" → pyrealsense2 driver
   #   - "uvc"       → pyuvc driver
-  type: uvc
+  type: rtp_h264_stereo
+  left_rtp_port: 5002
+  right_rtp_port: 5003
 
   # Image Format
   # image resolution: [height, width]
-  image_shape: [480, 1280]
+  image_shape: [448, 1088]
   binocular: true
   # frame per second
-  fps: 30
+  fps: 15
 
   # Camera identifiers (choose one or more):
   #   - video_id: X        → /dev/videoX  (e.g. 0 → /dev/video0)
@@ -55,17 +57,17 @@ head_camera:
   #   - type "realsense": supports serial_number only (but a RealSense can also be used as opencv/uvc if desired)
   #   - type "opencv":    supports video_id, serial_number, physical_path
   #   - type "uvc":       supports video_id, serial_number, physical_path
-  video_id: 0
-  serial_number: 01.00.00
+  video_id: null
+  serial_number: null
   physical_path: null
 
 # =====================================================
 # Left wrist camera configuration
 # =====================================================
 left_wrist_camera:
-  enable_zmq: true
+  enable_zmq: false
   zmq_port : 55556
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port : 60002
   webrtc_codec: h264
   type: uvc
@@ -80,9 +82,9 @@ left_wrist_camera:
 # Right wrist camera configuration
 # =====================================================
 right_wrist_camera:
-  enable_zmq: true
+  enable_zmq: false
   zmq_port : 55557
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port: 60003
   webrtc_codec: h264
   type: uvc
