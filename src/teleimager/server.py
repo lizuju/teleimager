@@ -46,6 +46,10 @@ from .client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
 # client.py, which prefers TurboJPEG and falls back to OpenCV when the native
 # libjpeg-turbo 3.0+ library is not installable on the host.
 from .client import _turbojpeg
+# Out-of-process H.264 RTP stereo capture. Importing this module is safe: it
+# only pulls in PyGObject inside run_capture(), which executes in a separate
+# interpreter (see GstStereoRtpCamera).
+from .gst_stereo_capture import StereoCapture, MAX_FRAME_AGE
 import asyncio
 import json
 import ssl
@@ -1948,6 +1952,87 @@ class GStreamerCamera(BaseCamera):
             return None
         return cls(cam_topic, gst_pipeline, server_cfg)
 
+
+class GstStereoRtpCamera(BaseCamera):
+    """Two H.264 RTP eyes decoded by an out-of-process GStreamer helper.
+
+    The Unitree stereo patch streams each eye as H.264/RTP on its own UDP port.
+    Decoding runs in gst_stereo_capture.py, which re-invokes itself with the
+    system python3 so the PyGObject/GStreamer bindings are the distro's own;
+    the service interpreter therefore does not need `gi`. This also keeps the
+    helper's pairing rules, which a plain compositor pipeline does not give:
+    a pair is emitted only when both eyes arrived within MAX_PAIR_SKEW and are
+    younger than MAX_FRAME_AGE.
+
+    The helper sends raw BGR frames prefixed with a header, so ZMQ is served by
+    encoding here rather than forwarding a JPEG straight through.
+    """
+
+    def __init__(self, cam_topic, left_rtp_port, right_rtp_port, server_cfg):
+        super().__init__(cam_topic, server_cfg)
+        self._rtp_ports = (int(left_rtp_port), int(right_rtp_port))
+        self._capture = StereoCapture(*self._rtp_ports)
+        self._frame_timestamp = 0.0
+        logger_mp.info(str(self))
+
+    @classmethod
+    def from_config(cls, cam_topic, server_cfg):
+        left = server_cfg.get("left_rtp_port")
+        right = server_cfg.get("right_rtp_port")
+        if left is None or right is None:
+            logger_mp.error(
+                f"[Teleimager] type 'rtp_h264_stereo' for {cam_topic} requires "
+                "'left_rtp_port' and 'right_rtp_port'."
+            )
+            return None
+        return cls(cam_topic, left, right, server_cfg)
+
+    def __str__(self):
+        zmq = f"zmq=on (port={self._zmq_port})" if self._enable_zmq else "zmq=off"
+        webrtc = f"webrtc=on (port={self._webrtc_port})" if self._enable_webrtc else "webrtc=off"
+        return (
+            f" 📷 Camera {self._cam_topic!r:<22} rtp_h264_stereo "
+            f"udp={self._rtp_ports[0]}/{self._rtp_ports[1]}, "
+            f"{self._img_shape[0]}x{self._img_shape[1]}@{self._fps}fps, {zmq}, {webrtc}"
+        )
+
+    def _update_frame(self):
+        pair = self._capture.frames.take(timeout=1.0 if self._ready.is_set() else 5.0)
+        frames = []
+        for _timestamp, width, height, stride, data in pair:
+            rows = np.frombuffer(data, dtype=np.uint8).reshape(height, stride)
+            frames.append(rows[:, : width * 3].reshape(height, width, 3))
+        frame_data = np.ascontiguousarray(np.concatenate(frames, axis=1))
+        if self._img_shape is not None and tuple(frame_data.shape[:2]) != tuple(self._img_shape):
+            raise RuntimeError(
+                f"[Teleimager] {self._cam_topic}: stereo frame shape {frame_data.shape[:2]} "
+                f"differs from configured {tuple(self._img_shape)}"
+            )
+        timestamp = min(frame[0] for frame in pair)
+        if time.monotonic() - timestamp > MAX_FRAME_AGE:
+            raise TimeoutError(f"[Teleimager] {self._cam_topic}: stereo frame became stale during image processing")
+        if self._enable_zmq:
+            self._zmq_buffer.write(_turbojpeg.encode(frame_data))
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(frame_data)
+        self._frame_timestamp = timestamp
+        if not self._ready.is_set():
+            self._ready.set()
+
+    def get_jpeg_bytes(self):
+        if time.monotonic() - self._frame_timestamp > MAX_FRAME_AGE:
+            return None
+        return super().get_jpeg_bytes()
+
+    def get_bgr_frame(self):
+        if time.monotonic() - self._frame_timestamp > MAX_FRAME_AGE:
+            return None
+        return super().get_bgr_frame()
+
+    def release(self):
+        self._capture.close()
+
+
 class IsaacSimCamera(BaseCamera):
     def __init__(self, cam_topic, server_cfg, image_source="head"):
         """
@@ -2076,6 +2161,11 @@ class TeleImageServer:
                     self._cameras[cam_topic] = UVCCamera.from_config(cam_topic, server_cfg)
                 elif cam_type == "gstreamer":
                     self._cameras[cam_topic] = GStreamerCamera.from_config(cam_topic, server_cfg)
+                elif cam_type == "rtp_h264_stereo":
+                    camera = GstStereoRtpCamera.from_config(cam_topic, server_cfg)
+                    if camera is None:
+                        continue
+                    self._cameras[cam_topic] = camera
                 elif cam_type == "isaacsim":
                     self._cameras[cam_topic] = IsaacSimCamera.from_config(cam_topic, server_cfg)
                 else:
