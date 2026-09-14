@@ -326,12 +326,15 @@ class ZMQ_PublisherManager:
 # ========================================================
 class TeleImage:
     _NOT_SET = object()
-    __slots__ = ['jpg', '_bgr', 'fps']
+    __slots__ = ['jpg', '_bgr', 'fps', 'received_monotonic_ns', 'sequence']
 
-    def __init__(self, fps: float, jpg: Optional[bytes], bgr: Any = _NOT_SET):
+    def __init__(self, fps: float, jpg: Optional[bytes], bgr: Any = _NOT_SET,
+                 received_monotonic_ns=0, sequence=0):
         self.fps = fps
         self.jpg = jpg
         self._bgr = bgr
+        self.received_monotonic_ns = received_monotonic_ns
+        self.sequence = sequence
 
     @property
     def bgr(self) -> Optional[np.ndarray]:
@@ -386,6 +389,7 @@ class ZMQ_SubscriberThread(threading.Thread):
         self._started = threading.Event()
 
         self._jpg_3ring_buffer = TripleRingBuffer()
+        self._sequence = 0
         self._fps_monitor = SimpleFPSMonitor(window_size=10)
         if self._request_bgr:
             self._init_bgr_decoder()
@@ -421,13 +425,14 @@ class ZMQ_SubscriberThread(threading.Thread):
     def _decoder_loop(self):
         while self._running:
             try:
-                jpg_bytes = self._bgr_decode_queue.get(timeout=0.1)
-                if jpg_bytes is None:
+                packet = self._bgr_decode_queue.get(timeout=0.1)
+                try:
+                    if packet is None:
+                        continue
+                    img_numpy = self._decode_image(packet[2])
+                    self._bgr_3ring_buffer.write((packet, img_numpy))
+                finally:
                     self._bgr_decode_queue.task_done()
-                    continue
-                img_numpy = self._decode_image(jpg_bytes)
-                self._bgr_3ring_buffer.write(img_numpy)
-                self._bgr_decode_queue.task_done()
             except queue.Empty:
                 continue
         
@@ -445,12 +450,20 @@ class ZMQ_SubscriberThread(threading.Thread):
             The latest message as a TeleImage object containing raw bytes, decoded BGR image (if enabled), and FPS.
         """
         current_fps = self._fps_monitor.fps
-        jpg_data = self._jpg_3ring_buffer.read()
+        packet = self._jpg_3ring_buffer.read()
         if not self._request_bgr:
-            return TeleImage(fps=current_fps, jpg=jpg_data)
+            if packet is None:
+                return TeleImage(fps=current_fps, jpg=None)
+            received_ns, sequence, jpg_data = packet
+            return TeleImage(fps=current_fps, jpg=jpg_data,
+                             received_monotonic_ns=received_ns, sequence=sequence)
 
-        bgr_data = self._bgr_3ring_buffer.read()
-        return TeleImage(fps=current_fps, jpg=jpg_data, bgr=bgr_data)
+        decoded = self._bgr_3ring_buffer.read()
+        if decoded is None:
+            return TeleImage(fps=current_fps, jpg=None, bgr=None)
+        (received_ns, sequence, jpg_data), bgr_data = decoded
+        return TeleImage(fps=current_fps, jpg=jpg_data, bgr=bgr_data,
+                         received_monotonic_ns=received_ns, sequence=sequence)
 
     def stop(self) -> None:
         """Stop the subscriber thread gracefully."""
@@ -459,11 +472,15 @@ class ZMQ_SubscriberThread(threading.Thread):
         if self.is_alive():
             logger_mp.warning("Subscriber thread did not stop gracefully")
         if self._decoder_thread is not None:
-            with contextlib.suppress(queue.Full):
-                self._bgr_decode_queue.put_nowait(None)
             self._decoder_thread.join(timeout=1.0)
             if self._decoder_thread.is_alive():
                 logger_mp.warning("Subscriber decoder thread did not stop gracefully")
+            while True:
+                try:
+                    self._bgr_decode_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._bgr_decode_queue.task_done()
 
     def run(self) -> None:
         """Main subscriber loop with socket creation in worker thread."""
@@ -487,14 +504,19 @@ class ZMQ_SubscriberThread(threading.Thread):
                     try:
                         # receive the latest message
                         img_bytes = self._socket.recv()
+                        received_ns = time.monotonic_ns()
+                        self._sequence += 1
+                        packet = (received_ns, self._sequence, img_bytes)
                         # write to 3-ring-buffer
-                        self._jpg_3ring_buffer.write(img_bytes)
+                        self._jpg_3ring_buffer.write(packet)
                         # enqueue for decoding if needed
                         if self._request_bgr:
                             try:
                                 if self._bgr_decode_queue.full():
-                                    self._bgr_decode_queue.get_nowait()
-                                self._bgr_decode_queue.put_nowait(img_bytes)
+                                    with contextlib.suppress(queue.Empty):
+                                        self._bgr_decode_queue.get_nowait()
+                                        self._bgr_decode_queue.task_done()
+                                self._bgr_decode_queue.put_nowait(packet)
                             except queue.Full:
                                 pass
                         # update fps
@@ -505,15 +527,7 @@ class ZMQ_SubscriberThread(threading.Thread):
                             logger_mp.error(f"Error in subscriber loop: {e}")
                         break
                 else:
-                    self._jpg_3ring_buffer.write(None)
-                    if self._request_bgr:
-                        try:
-                            if self._bgr_decode_queue.full():
-                                self._bgr_decode_queue.get_nowait()
-                            self._bgr_decode_queue.put_nowait(None)
-                        except queue.Full:
-                            pass
-
+                    # Keep the last packet's receive time; consumers can detect its age.
                     self._fps_monitor.reset()
                     logger_mp.debug(f"No message received from {self._host}:{self._port} within timeout.")
         except Exception as e:
