@@ -42,9 +42,10 @@ import re
 import subprocess
 import platform
 from .client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
-# Shared JPEG codec (libturbojpeg): encode(BGR)->jpeg bytes, decode(jpeg)->BGR.
-from turbojpeg import TurboJPEG
-_turbojpeg = TurboJPEG()
+# Shared JPEG codec: encode(BGR)->jpeg bytes, decode(jpeg)->BGR. Resolved in
+# client.py, which prefers TurboJPEG and falls back to OpenCV when the native
+# libjpeg-turbo 3.0+ library is not installable on the host.
+from .client import _turbojpeg
 import asyncio
 import json
 import ssl

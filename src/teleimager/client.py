@@ -40,40 +40,39 @@ CLIENT_CONFIG_PATH = str(CONFIG_DIR / "teleimager_client.yaml")
 # Seconds of uninterrupted empty frames before the no-frame watchdog warns once.
 STALL_SECONDS = 3.0
 
-# Shared JPEG decoder (jpeg bytes -> BGR ndarray).
+# Shared JPEG codec (jpeg bytes <-> BGR ndarray).
+# TurboJPEG is the upstream default and is substantially faster, but it needs
+# PyTurboJPEG plus a libjpeg-turbo 3.0+ shared library. Some deployments cannot
+# install those (no root, or the distro only ships 2.x), and JPEG coding is a
+# performance path rather than a correctness one, so fall back to OpenCV rather
+# than refusing to start. Both expose the same encode()/decode() surface, so
+# call sites are identical either way. TurboJPEG is used whenever available.
+class _OpenCVJpegCodec:
+    """TurboJPEG-compatible stand-in backed by OpenCV."""
+
+    def encode(self, img, *args, **kwargs):
+        import cv2
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            raise RuntimeError("OpenCV JPEG encode failed")
+        return buf.tobytes()
+
+    def decode(self, jpg_bytes, *args, **kwargs):
+        import cv2
+        if jpg_bytes is None:
+            return None
+        return cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
 try:
     from turbojpeg import TurboJPEG
     _turbojpeg = TurboJPEG()
 except Exception as e:
-    logger_mp.error(
-        "\n"
-        "  [Teleimager] Failed to initialize TurboJPEG.\n"
-        "\n"
-        "  Step 1: Install the Python binding:\n"
-        "      pip install PyTurboJPEG\n"
-        "  (Note: Do NOT install the PyPI package named 'turbojpeg' - it is a different, incompatible library.)\n"
-        "\n"
-        "  Step 2: Install the native C library (libjpeg-turbo 3.0+ is required).\n"
-        "\n"
-        "  Choose one of the following methods:\n"
-        "\n"
-        "  [Method 1 - Conda] (Recommended, cross-platform, handles paths automatically):\n"
-        "      conda install -c conda-forge libjpeg-turbo\n"
-        "\n"
-        "  [Method 2 - Compile from source] (For Ubuntu/Debian to get the latest 3.x):\n"
-        "      git clone https://github.com/libjpeg-turbo/libjpeg-turbo.git\n"
-        "      cd libjpeg-turbo && mkdir build && cd build\n"
-        "      cmake -DCMAKE_INSTALL_PREFIX=/opt/libjpeg-turbo ..\n"
-        "      make -j$(nproc) && sudo make install\n"
-        "      echo 'export LD_LIBRARY_PATH=/opt/libjpeg-turbo/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc\n"
-        "      source ~/.bashrc\n"
-        "\n"
-        "  [Method 3 - Homebrew] (For macOS):\n"
-        "      brew install jpeg-turbo\n"
-        "\n"
-        f"  Original error: {e}"
+    logger_mp.warning(
+        f"[Teleimager] TurboJPEG unavailable ({e}); using OpenCV JPEG coding. "
+        "Install PyTurboJPEG plus libjpeg-turbo 3.0+ for the faster path."
     )
-    sys.exit(1)
+    _turbojpeg = _OpenCVJpegCodec()
 
 # ========================================================
 # Utility tools
@@ -415,7 +414,7 @@ class ZMQ_SubscriberThread(threading.Thread):
         self._decoder_thread.start()
 
     def _decode_image(self, jpg_bytes):
-        """Decode JPEG bytes to a BGR ndarray via libturbojpeg."""
+        """Decode JPEG bytes to a BGR ndarray."""
         if jpg_bytes is None:
             return None
         try:
