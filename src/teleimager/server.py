@@ -42,9 +42,14 @@ import re
 import subprocess
 import platform
 from .client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
-# Shared JPEG codec (libturbojpeg): encode(BGR)->jpeg bytes, decode(jpeg)->BGR.
-from turbojpeg import TurboJPEG
-_turbojpeg = TurboJPEG()
+# Shared JPEG codec: encode(BGR)->jpeg bytes, decode(jpeg)->BGR. Resolved in
+# client.py, which prefers TurboJPEG and falls back to OpenCV when the native
+# libjpeg-turbo 3.0+ library is not installable on the host.
+from .client import _turbojpeg
+# Out-of-process H.264 RTP stereo capture. Importing this module is safe: it
+# only pulls in PyGObject inside run_capture(), which executes in a separate
+# interpreter (see GstStereoRtpCamera).
+from .gst_stereo_capture import StereoCapture, MAX_FRAME_AGE
 import asyncio
 import json
 import ssl
@@ -847,6 +852,13 @@ class BaseCamera:
             self._zmq_buffer = TripleRingBuffer()
         else:
             self._zmq_buffer = None
+        # Bumped by the capture thread every time a genuinely new frame lands in
+        # the buffers, so the publishers can send it immediately instead of
+        # polling on a fixed period. Polling delayed every new frame by up to one
+        # publish period and re-sent the same JPEG whenever the source was
+        # slower than `fps`.
+        self._frame_seq = 0
+        self._frame_condition = threading.Condition()
 
         self._enable_webrtc = server_cfg.get("enable_webrtc", False)
         self._webrtc_port = server_cfg.get("webrtc_port", None)
@@ -883,6 +895,23 @@ class BaseCamera:
     def get_bgr_frame(self):
         bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
         return bgr_numpy
+
+    def signal_new_frame(self):
+        """Called by the capture thread once a new frame is in the buffers."""
+        with self._frame_condition:
+            self._frame_seq += 1
+            self._frame_condition.notify_all()
+
+    def wait_for_new_frame(self, seen_seq, timeout):
+        """Block until the frame counter passes `seen_seq`; return the new value.
+
+        Returns `seen_seq` unchanged on timeout, which the caller reads as
+        "nothing new arrived".
+        """
+        with self._frame_condition:
+            if self._frame_seq == seen_seq:
+                self._frame_condition.wait(timeout)
+            return self._frame_seq
 
     def get_depth_frame(self):
         """Return a depth frame as bytes, or None if not supported. 
@@ -1947,6 +1976,87 @@ class GStreamerCamera(BaseCamera):
             return None
         return cls(cam_topic, gst_pipeline, server_cfg)
 
+
+class GstStereoRtpCamera(BaseCamera):
+    """Two H.264 RTP eyes decoded by an out-of-process GStreamer helper.
+
+    The Unitree stereo patch streams each eye as H.264/RTP on its own UDP port.
+    Decoding runs in gst_stereo_capture.py, which re-invokes itself with the
+    system python3 so the PyGObject/GStreamer bindings are the distro's own;
+    the service interpreter therefore does not need `gi`. This also keeps the
+    helper's pairing rules, which a plain compositor pipeline does not give:
+    a pair is emitted only when both eyes arrived within MAX_PAIR_SKEW and are
+    younger than MAX_FRAME_AGE.
+
+    The helper sends raw BGR frames prefixed with a header, so ZMQ is served by
+    encoding here rather than forwarding a JPEG straight through.
+    """
+
+    def __init__(self, cam_topic, left_rtp_port, right_rtp_port, server_cfg):
+        super().__init__(cam_topic, server_cfg)
+        self._rtp_ports = (int(left_rtp_port), int(right_rtp_port))
+        self._capture = StereoCapture(*self._rtp_ports)
+        self._frame_timestamp = 0.0
+        logger_mp.info(str(self))
+
+    @classmethod
+    def from_config(cls, cam_topic, server_cfg):
+        left = server_cfg.get("left_rtp_port")
+        right = server_cfg.get("right_rtp_port")
+        if left is None or right is None:
+            logger_mp.error(
+                f"[Teleimager] type 'rtp_h264_stereo' for {cam_topic} requires "
+                "'left_rtp_port' and 'right_rtp_port'."
+            )
+            return None
+        return cls(cam_topic, left, right, server_cfg)
+
+    def __str__(self):
+        zmq = f"zmq=on (port={self._zmq_port})" if self._enable_zmq else "zmq=off"
+        webrtc = f"webrtc=on (port={self._webrtc_port})" if self._enable_webrtc else "webrtc=off"
+        return (
+            f" 📷 Camera {self._cam_topic!r:<22} rtp_h264_stereo "
+            f"udp={self._rtp_ports[0]}/{self._rtp_ports[1]}, "
+            f"{self._img_shape[0]}x{self._img_shape[1]}@{self._fps}fps, {zmq}, {webrtc}"
+        )
+
+    def _update_frame(self):
+        pair = self._capture.frames.take(timeout=1.0 if self._ready.is_set() else 5.0)
+        frames = []
+        for _timestamp, width, height, stride, data in pair:
+            rows = np.frombuffer(data, dtype=np.uint8).reshape(height, stride)
+            frames.append(rows[:, : width * 3].reshape(height, width, 3))
+        frame_data = np.ascontiguousarray(np.concatenate(frames, axis=1))
+        if self._img_shape is not None and tuple(frame_data.shape[:2]) != tuple(self._img_shape):
+            raise RuntimeError(
+                f"[Teleimager] {self._cam_topic}: stereo frame shape {frame_data.shape[:2]} "
+                f"differs from configured {tuple(self._img_shape)}"
+            )
+        timestamp = min(frame[0] for frame in pair)
+        if time.monotonic() - timestamp > MAX_FRAME_AGE:
+            raise TimeoutError(f"[Teleimager] {self._cam_topic}: stereo frame became stale during image processing")
+        if self._enable_zmq:
+            self._zmq_buffer.write(_turbojpeg.encode(frame_data))
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(frame_data)
+        self._frame_timestamp = timestamp
+        if not self._ready.is_set():
+            self._ready.set()
+
+    def get_jpeg_bytes(self):
+        if time.monotonic() - self._frame_timestamp > MAX_FRAME_AGE:
+            return None
+        return super().get_jpeg_bytes()
+
+    def get_bgr_frame(self):
+        if time.monotonic() - self._frame_timestamp > MAX_FRAME_AGE:
+            return None
+        return super().get_bgr_frame()
+
+    def release(self):
+        self._capture.close()
+
+
 class IsaacSimCamera(BaseCamera):
     def __init__(self, cam_topic, server_cfg, image_source="head"):
         """
@@ -2075,6 +2185,11 @@ class TeleImageServer:
                     self._cameras[cam_topic] = UVCCamera.from_config(cam_topic, server_cfg)
                 elif cam_type == "gstreamer":
                     self._cameras[cam_topic] = GStreamerCamera.from_config(cam_topic, server_cfg)
+                elif cam_type == "rtp_h264_stereo":
+                    camera = GstStereoRtpCamera.from_config(cam_topic, server_cfg)
+                    if camera is None:
+                        continue
+                    self._cameras[cam_topic] = camera
                 elif cam_type == "isaacsim":
                     self._cameras[cam_topic] = IsaacSimCamera.from_config(cam_topic, server_cfg)
                 else:
@@ -2094,6 +2209,7 @@ class TeleImageServer:
             while not self._stop_event.is_set():
                 try:
                     camera._update_frame()
+                    camera.signal_new_frame()
                 except Exception as e:
                     logger_mp.error(f"[Teleimager] Error updating frame for {cam_topic} camera")
                     self._stop_event.set()
@@ -2109,50 +2225,50 @@ class TeleImageServer:
             self._stop_event.set()
 
     def _zmq_pub(self, cam_topic: str, camera: BaseCamera):
-        try:
-            interval = 1.0 / camera.get_fps()
-            next_frame_time = time.monotonic()
+        """Send each captured frame as soon as it exists.
 
+        This used to sleep to 1/fps between sends, which added up to one publish
+        period of latency to every new frame (measured head arrival-interval p95
+        of 174/133/117 ms at fps=15/30/60 against a ~100 ms source period) and
+        re-published an identical JPEG whenever the source was slower than fps.
+        """
+        try:
+            seen_seq = 0
             while not self._stop_event.is_set():
+                seq = camera.wait_for_new_frame(seen_seq, timeout=1.0)
+                if seq == seen_seq:
+                    continue  # nothing new yet
+                seen_seq = seq
                 jpeg_bytes = camera.get_jpeg_bytes()
-                if jpeg_bytes is not None:
-                    self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
-                else:
+                if jpeg_bytes is None:
                     logger_mp.warning(f"[Teleimager] {cam_topic} returned no frame.")
                     self._stop_event.set()
                     break
-
-                next_frame_time += interval
-                sleep_time = next_frame_time - time.monotonic()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_frame_time = time.monotonic()
+                self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
         except Exception as e:
             logger_mp.error(f"[Teleimager] Failed to publish zmq frame from {cam_topic} camera.")
             self._stop_event.set()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
-        try:
-            interval = 1.0 / camera.get_fps()
-            webrtc_codec = camera.get_webrtc_codec()
-            next_frame_time = time.monotonic()
-            while not self._stop_event.is_set():
-                bgr_frame = camera.get_bgr_frame()
+        """Encode and send each captured frame as soon as it exists.
 
-                if bgr_frame is not None:
-                    self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
-                else:
+        Same reasoning as _zmq_pub: sleeping to 1/fps delayed the displayed frame
+        and re-encoded an identical frame when the source was slower than fps.
+        """
+        try:
+            webrtc_codec = camera.get_webrtc_codec()
+            seen_seq = 0
+            while not self._stop_event.is_set():
+                seq = camera.wait_for_new_frame(seen_seq, timeout=1.0)
+                if seq == seen_seq:
+                    continue  # nothing new yet
+                seen_seq = seq
+                bgr_frame = camera.get_bgr_frame()
+                if bgr_frame is None:
                     logger_mp.info(f"[Teleimager] {cam_topic} returned no frame.")
                     self._stop_event.set()
                     break
-
-                next_frame_time += interval
-                sleep_time = next_frame_time - time.monotonic()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_frame_time = time.monotonic()
+                self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
         except Exception as e:
             logger_mp.error(f"[Teleimager] Failed to publish rtc frame from {cam_topic} camera.")
             self._stop_event.set()

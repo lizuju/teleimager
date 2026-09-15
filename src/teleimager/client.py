@@ -40,40 +40,41 @@ CLIENT_CONFIG_PATH = str(CONFIG_DIR / "teleimager_client.yaml")
 # Seconds of uninterrupted empty frames before the no-frame watchdog warns once.
 STALL_SECONDS = 3.0
 
-# Shared JPEG decoder (jpeg bytes -> BGR ndarray).
+# Shared JPEG codec (jpeg bytes <-> BGR ndarray).
+# TurboJPEG is the upstream default and is substantially faster, but it needs
+# PyTurboJPEG plus a libjpeg-turbo 3.0+ shared library. Some deployments cannot
+# install those (no root, or the distro only ships 2.x), and JPEG coding is a
+# performance path rather than a correctness one, so fall back to OpenCV rather
+# than refusing to start. Both expose the same encode()/decode() surface, so
+# call sites are identical either way. TurboJPEG is used whenever available.
+class _OpenCVJpegCodec:
+    """TurboJPEG-compatible stand-in backed by OpenCV."""
+
+    def encode(self, img, *args, **kwargs):
+        import cv2
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            raise RuntimeError("OpenCV JPEG encode failed")
+        return buf.tobytes()
+
+    def decode(self, jpg_bytes, *args, **kwargs):
+        import cv2
+        if jpg_bytes is None:
+            return None
+        return cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+# Seconds of uninterrupted empty frames before the no-frame watchdog warns once.
+STALL_SECONDS = 3.0
+
 try:
     from turbojpeg import TurboJPEG
     _turbojpeg = TurboJPEG()
 except Exception as e:
-    logger_mp.error(
-        "\n"
-        "  [Teleimager] Failed to initialize TurboJPEG.\n"
-        "\n"
-        "  Step 1: Install the Python binding:\n"
-        "      pip install PyTurboJPEG\n"
-        "  (Note: Do NOT install the PyPI package named 'turbojpeg' - it is a different, incompatible library.)\n"
-        "\n"
-        "  Step 2: Install the native C library (libjpeg-turbo 3.0+ is required).\n"
-        "\n"
-        "  Choose one of the following methods:\n"
-        "\n"
-        "  [Method 1 - Conda] (Recommended, cross-platform, handles paths automatically):\n"
-        "      conda install -c conda-forge libjpeg-turbo\n"
-        "\n"
-        "  [Method 2 - Compile from source] (For Ubuntu/Debian to get the latest 3.x):\n"
-        "      git clone https://github.com/libjpeg-turbo/libjpeg-turbo.git\n"
-        "      cd libjpeg-turbo && mkdir build && cd build\n"
-        "      cmake -DCMAKE_INSTALL_PREFIX=/opt/libjpeg-turbo ..\n"
-        "      make -j$(nproc) && sudo make install\n"
-        "      echo 'export LD_LIBRARY_PATH=/opt/libjpeg-turbo/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc\n"
-        "      source ~/.bashrc\n"
-        "\n"
-        "  [Method 3 - Homebrew] (For macOS):\n"
-        "      brew install jpeg-turbo\n"
-        "\n"
-        f"  Original error: {e}"
+    logger_mp.warning(
+        f"[Teleimager] TurboJPEG unavailable ({e}); using OpenCV JPEG coding. "
+        "Install PyTurboJPEG plus libjpeg-turbo 3.0+ for the faster path."
     )
-    sys.exit(1)
+    _turbojpeg = _OpenCVJpegCodec()
 
 # ========================================================
 # Utility tools
@@ -336,12 +337,15 @@ class ZMQ_PublisherManager:
 # ========================================================
 class TeleImage:
     _NOT_SET = object()
-    __slots__ = ['jpg', '_bgr', 'fps']
+    __slots__ = ['jpg', '_bgr', 'fps', 'received_monotonic_ns', 'sequence']
 
-    def __init__(self, fps: float, jpg: Optional[bytes], bgr: Any = _NOT_SET):
+    def __init__(self, fps: float, jpg: Optional[bytes], bgr: Any = _NOT_SET,
+                 received_monotonic_ns: int = 0, sequence: int = 0):
         self.fps = fps
         self.jpg = jpg
         self._bgr = bgr
+        self.received_monotonic_ns = received_monotonic_ns
+        self.sequence = sequence
 
     @property
     def bgr(self) -> Optional[np.ndarray]:
@@ -396,6 +400,7 @@ class ZMQ_SubscriberThread(threading.Thread):
         self._started = threading.Event()
 
         self._jpg_3ring_buffer = TripleRingBuffer()
+        self._sequence = 0
         self._fps_monitor = SimpleFPSMonitor(window_size=10)
         if self._request_bgr:
             self._init_bgr_decoder()
@@ -411,7 +416,7 @@ class ZMQ_SubscriberThread(threading.Thread):
         self._decoder_thread.start()
 
     def _decode_image(self, jpg_bytes):
-        """Decode JPEG bytes to a BGR ndarray via libturbojpeg."""
+        """Decode JPEG bytes to a BGR ndarray."""
         if jpg_bytes is None:
             return None
         try:
@@ -430,13 +435,14 @@ class ZMQ_SubscriberThread(threading.Thread):
     def _decoder_loop(self):
         while self._running:
             try:
-                jpg_bytes = self._bgr_decode_queue.get(timeout=0.1)
-                if jpg_bytes is None:
+                packet = self._bgr_decode_queue.get(timeout=0.1)
+                try:
+                    if packet is None:
+                        continue
+                    img_numpy = self._decode_image(packet[2])
+                    self._bgr_3ring_buffer.write((packet, img_numpy))
+                finally:
                     self._bgr_decode_queue.task_done()
-                    continue
-                img_numpy = self._decode_image(jpg_bytes)
-                self._bgr_3ring_buffer.write(img_numpy)
-                self._bgr_decode_queue.task_done()
             except queue.Empty:
                 continue
         
@@ -454,12 +460,20 @@ class ZMQ_SubscriberThread(threading.Thread):
             The latest message as a TeleImage object containing raw bytes, decoded BGR image (if enabled), and FPS.
         """
         current_fps = self._fps_monitor.fps
-        jpg_data = self._jpg_3ring_buffer.read()
+        packet = self._jpg_3ring_buffer.read()
         if not self._request_bgr:
-            return TeleImage(fps=current_fps, jpg=jpg_data)
+            if packet is None:
+                return TeleImage(fps=current_fps, jpg=None)
+            received_ns, sequence, jpg_data = packet
+            return TeleImage(fps=current_fps, jpg=jpg_data,
+                             received_monotonic_ns=received_ns, sequence=sequence)
 
-        bgr_data = self._bgr_3ring_buffer.read()
-        return TeleImage(fps=current_fps, jpg=jpg_data, bgr=bgr_data)
+        decoded = self._bgr_3ring_buffer.read()
+        if decoded is None:
+            return TeleImage(fps=current_fps, jpg=None, bgr=None)
+        (received_ns, sequence, jpg_data), bgr_data = decoded
+        return TeleImage(fps=current_fps, jpg=jpg_data, bgr=bgr_data,
+                         received_monotonic_ns=received_ns, sequence=sequence)
 
     def stop(self) -> None:
         """Stop the subscriber thread gracefully."""
@@ -468,11 +482,15 @@ class ZMQ_SubscriberThread(threading.Thread):
         if self.is_alive():
             logger_mp.warning("[Teleimager] Subscriber thread did not stop gracefully")
         if self._decoder_thread is not None:
-            with contextlib.suppress(queue.Full):
-                self._bgr_decode_queue.put_nowait(None)
             self._decoder_thread.join(timeout=1.0)
             if self._decoder_thread.is_alive():
                 logger_mp.warning("[Teleimager] Subscriber decoder thread did not stop gracefully")
+            while True:
+                try:
+                    self._bgr_decode_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._bgr_decode_queue.task_done()
 
     def run(self) -> None:
         """Main subscriber loop with socket creation in worker thread."""
@@ -499,14 +517,19 @@ class ZMQ_SubscriberThread(threading.Thread):
                     try:
                         # receive the latest message
                         img_bytes = self._socket.recv()
+                        received_ns = time.monotonic_ns()
+                        self._sequence += 1
+                        packet = (received_ns, self._sequence, img_bytes)
                         # write to 3-ring-buffer
-                        self._jpg_3ring_buffer.write(img_bytes)
+                        self._jpg_3ring_buffer.write(packet)
                         # enqueue for decoding if needed
                         if self._request_bgr:
                             try:
                                 if self._bgr_decode_queue.full():
-                                    self._bgr_decode_queue.get_nowait()
-                                self._bgr_decode_queue.put_nowait(img_bytes)
+                                    with contextlib.suppress(queue.Empty):
+                                        self._bgr_decode_queue.get_nowait()
+                                        self._bgr_decode_queue.task_done()
+                                self._bgr_decode_queue.put_nowait(packet)
                             except queue.Full:
                                 pass
                         # update fps
@@ -518,15 +541,8 @@ class ZMQ_SubscriberThread(threading.Thread):
                             logger_mp.error(f"[Teleimager] Error in subscriber loop: {e}")
                         break
                 else:
-                    self._jpg_3ring_buffer.write(None)
-                    if self._request_bgr:
-                        try:
-                            if self._bgr_decode_queue.full():
-                                self._bgr_decode_queue.get_nowait()
-                            self._bgr_decode_queue.put_nowait(None)
-                        except queue.Full:
-                            pass
-
+                    # Keep the last packet and its receive time so consumers can
+                    # measure frame age instead of seeing the buffer cleared.
                     empty_polls += 1
                     if empty_polls >= stall_threshold:
                         self._fps_monitor.reset()
