@@ -9,3 +9,5 @@ build/
 *.key
 *.cnf
 *_client.yaml
+# Local deployment backups (*.pre-<feature>-<date>)
+*.pre-*
