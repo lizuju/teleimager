@@ -19,6 +19,7 @@
 # ------------------------------------------------------------------------------
 
 import time
+from .timing import ClockMapping, clock_id, jpeg_timestamp
 import contextlib
 import queue
 import threading
@@ -231,6 +232,8 @@ class ZMQ_PublisherThread(threading.Thread):
         except Exception as e:
             logger_mp.error(f"[Teleimager] Failed to initialize publisher socket: {e}")
         finally:
+            if clock_socket is not None:
+                clock_socket.close()
             # Ensure socket is closed when thread exits
             if self._socket:
                 try:
@@ -337,15 +340,16 @@ class ZMQ_PublisherManager:
 # ========================================================
 class TeleImage:
     _NOT_SET = object()
-    __slots__ = ['jpg', '_bgr', 'fps', 'received_monotonic_ns', 'sequence']
+    __slots__ = ['jpg', '_bgr', 'fps', 'received_monotonic_ns', 'sequence', 'timing']
 
     def __init__(self, fps: float, jpg: Optional[bytes], bgr: Any = _NOT_SET,
-                 received_monotonic_ns: int = 0, sequence: int = 0):
+                 received_monotonic_ns: int = 0, sequence: int = 0, timing=None):
         self.fps = fps
         self.jpg = jpg
         self._bgr = bgr
         self.received_monotonic_ns = received_monotonic_ns
         self.sequence = sequence
+        self.timing = timing
 
     @property
     def bgr(self) -> Optional[np.ndarray]:
@@ -401,6 +405,7 @@ class ZMQ_SubscriberThread(threading.Thread):
 
         self._jpg_3ring_buffer = TripleRingBuffer()
         self._sequence = 0
+        self._clock_mapping = ClockMapping()
         self._fps_monitor = SimpleFPSMonitor(window_size=10)
         if self._request_bgr:
             self._init_bgr_decoder()
@@ -464,16 +469,16 @@ class ZMQ_SubscriberThread(threading.Thread):
         if not self._request_bgr:
             if packet is None:
                 return TeleImage(fps=current_fps, jpg=None)
-            received_ns, sequence, jpg_data = packet
+            received_ns, sequence, jpg_data, timing = packet
             return TeleImage(fps=current_fps, jpg=jpg_data,
-                             received_monotonic_ns=received_ns, sequence=sequence)
+                             received_monotonic_ns=received_ns, sequence=sequence, timing=timing)
 
         decoded = self._bgr_3ring_buffer.read()
         if decoded is None:
             return TeleImage(fps=current_fps, jpg=None, bgr=None)
-        (received_ns, sequence, jpg_data), bgr_data = decoded
+        (received_ns, sequence, jpg_data, timing), bgr_data = decoded
         return TeleImage(fps=current_fps, jpg=jpg_data, bgr=bgr_data,
-                         received_monotonic_ns=received_ns, sequence=sequence)
+                         received_monotonic_ns=received_ns, sequence=sequence, timing=timing)
 
     def stop(self) -> None:
         """Stop the subscriber thread gracefully."""
@@ -494,6 +499,7 @@ class ZMQ_SubscriberThread(threading.Thread):
 
     def run(self) -> None:
         """Main subscriber loop with socket creation in worker thread."""
+        clock_socket = None
         try:
             # Create socket in the worker thread
             self._socket = self._context.socket(zmq.SUB)
@@ -509,17 +515,48 @@ class ZMQ_SubscriberThread(threading.Thread):
             # Signal that socket is ready
             self._started.set()
 
+            clock_socket = None
+            clock_sent_ns = 0
+            next_clock_ns = 0
             empty_polls = 0
             stall_threshold = max(1, int(STALL_SECONDS * 1000 / 100))
             while self._running:
+                now_ns = time.monotonic_ns()
+                if clock_socket is None and now_ns >= next_clock_ns:
+                    clock_socket = self._context.socket(zmq.REQ)
+                    clock_socket.setsockopt(zmq.LINGER, 0)
+                    clock_socket.connect(f"tcp://{self._host}:60000")
+                    poller.register(clock_socket, zmq.POLLIN)
+                    clock_sent_ns = time.monotonic_ns()
+                    clock_socket.send(b"GET_CLOCK")
                 events = dict(poller.poll(timeout=100))
+                if clock_socket is not None:
+                    if clock_socket in events:
+                        reply_bytes = clock_socket.recv()
+                        received_clock_ns = time.monotonic_ns()
+                        import json
+                        try:
+                            self._clock_mapping.observe(clock_sent_ns, received_clock_ns,
+                                                        json.loads(reply_bytes))
+                        except ValueError:
+                            pass
+                        poller.unregister(clock_socket)
+                        clock_socket.close()
+                        clock_socket = None
+                        next_clock_ns = received_clock_ns + 2_000_000_000
+                    elif time.monotonic_ns() - clock_sent_ns > 500_000_000:
+                        poller.unregister(clock_socket)
+                        clock_socket.close()
+                        clock_socket = None
+                        next_clock_ns = time.monotonic_ns() + 2_000_000_000
                 if self._socket in events:
                     try:
                         # receive the latest message
                         img_bytes = self._socket.recv()
                         received_ns = time.monotonic_ns()
                         self._sequence += 1
-                        packet = (received_ns, self._sequence, img_bytes)
+                        timing = self._clock_mapping.map(jpeg_timestamp(img_bytes), received_ns)
+                        packet = (received_ns, self._sequence, img_bytes, timing)
                         # write to 3-ring-buffer
                         self._jpg_3ring_buffer.write(packet)
                         # enqueue for decoding if needed
@@ -655,6 +692,7 @@ class ZMQ_Responser:
             poll_timeout: Timeout in milliseconds for poll() to check for requests.
         """
         self._server_config = server_config
+        self._clock_id = clock_id()
         self._host = host
         self._port = port
         self._context = zmq.Context()
@@ -673,8 +711,13 @@ class ZMQ_Responser:
             try:
                 socks = dict(poller.poll(timeout=200))
                 if self._socket in socks and socks[self._socket] == zmq.POLLIN:
-                    _ = self._socket.recv()  # receive request
-                    self._socket.send_json(self._server_config)
+                    request = self._socket.recv()
+                    received_ns = time.monotonic_ns()
+                    if request == b"GET_CLOCK":
+                        self._socket.send_json({"clock_id": self._clock_id, "receive_ns": received_ns,
+                                                "send_ns": time.monotonic_ns()})
+                    else:
+                        self._socket.send_json(self._server_config)
             except zmq.ZMQError as e:
                 if not self._running:
                     break  # normal exit when stopping

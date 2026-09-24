@@ -50,6 +50,7 @@ from .client import _turbojpeg
 # only pulls in PyGObject inside run_capture(), which executes in a separate
 # interpreter (see GstStereoRtpCamera).
 from .gst_stereo_capture import StereoCapture, MAX_FRAME_AGE
+from .timing import clock_id, timestamp_jpeg
 import asyncio
 import json
 import ssl
@@ -858,6 +859,8 @@ class BaseCamera:
         # publish period and re-sent the same JPEG whenever the source was
         # slower than `fps`.
         self._frame_seq = 0
+        self._source_sequence = 0
+        self._clock_id = clock_id()
         self._frame_condition = threading.Condition()
 
         self._enable_webrtc = server_cfg.get("enable_webrtc", False)
@@ -887,6 +890,13 @@ class BaseCamera:
     
     def enable_zmq(self):
         return self._enable_zmq
+
+    def _write_timed_jpeg(self, jpeg_bytes, source_ns, timestamp_kind, **extra):
+        self._source_sequence += 1
+        self._zmq_buffer.write(timestamp_jpeg(jpeg_bytes, {
+            "source_monotonic_ns": source_ns, "source_sequence": self._source_sequence,
+            "clock_id": self._clock_id, "timestamp_kind": timestamp_kind, **extra,
+        }))
 
     def get_jpeg_bytes(self):
         jpeg_bytes = self._zmq_buffer.read() if self._enable_zmq and self._zmq_buffer else None
@@ -1497,6 +1507,7 @@ class V4L2Camera(BaseCamera):
         if self.container is None:
             return
         packet = next(self._demux)
+        source_ns = time.monotonic_ns()
         if self._passthrough:
             # MJPG source: raw JPEG straight to ZMQ (no re-encode, like UVCCamera);
             # decode to BGR lazily only when WebRTC needs it.
@@ -1504,7 +1515,7 @@ class V4L2Camera(BaseCamera):
             if not jpeg_bytes:
                 return
             if self._enable_zmq:
-                self._zmq_buffer.write(jpeg_bytes)
+                self._write_timed_jpeg(jpeg_bytes, source_ns, "pc2_v4l2_dequeue")
             if self._enable_webrtc:
                 self._webrtc_buffer.write(_turbojpeg.decode(jpeg_bytes))
         else:
@@ -1516,7 +1527,7 @@ class V4L2Camera(BaseCamera):
             if self._enable_webrtc:
                 self._webrtc_buffer.write(bgr_numpy)
             if self._enable_zmq:
-                self._zmq_buffer.write(_turbojpeg.encode(bgr_numpy))
+                self._write_timed_jpeg(_turbojpeg.encode(bgr_numpy), source_ns, "pc2_v4l2_dequeue")
 
         if not self._ready.is_set():
             self._ready.set()
@@ -2036,7 +2047,10 @@ class GstStereoRtpCamera(BaseCamera):
         if time.monotonic() - timestamp > MAX_FRAME_AGE:
             raise TimeoutError(f"[Teleimager] {self._cam_topic}: stereo frame became stale during image processing")
         if self._enable_zmq:
-            self._zmq_buffer.write(_turbojpeg.encode(frame_data))
+            eye_ns = [int(frame[0] * 1e9) for frame in pair]
+            self._write_timed_jpeg(_turbojpeg.encode(frame_data), min(eye_ns),
+                                   "pc2_rtp_decoded_receive", eye_monotonic_ns=eye_ns,
+                                   stereo_skew_ns=max(eye_ns) - min(eye_ns))
         if self._enable_webrtc:
             self._webrtc_buffer.write(frame_data)
         self._frame_timestamp = timestamp
