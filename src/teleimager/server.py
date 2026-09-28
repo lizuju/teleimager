@@ -57,6 +57,9 @@ import ssl
 from pathlib import Path
 import queue
 import fractions
+import uuid
+from collections import OrderedDict
+from .video_metadata import CHANNEL_LABEL, VideoMetadataSender
 from typing import Dict, Optional, Tuple, Any
 
 
@@ -332,6 +335,10 @@ class BGRArrayVideoStreamTrack(MediaStreamTrack):
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         self._start_time = None
         self._pts = 0
+        self._metadata_by_pts = OrderedDict()
+
+    def metadata_for_pts(self, pts):
+        return self._metadata_by_pts.get(pts)
 
     async def recv(self) -> av.VideoFrame:
         # This will suspend execution until a frame is available
@@ -342,6 +349,9 @@ class BGRArrayVideoStreamTrack(MediaStreamTrack):
     def push_frame(self, bgr_numpy: np.ndarray, loop: Optional[asyncio.AbstractEventLoop] = None):
         if bgr_numpy is None:
             return
+        metadata = None
+        if isinstance(bgr_numpy, tuple):
+            bgr_numpy, metadata = bgr_numpy
 
         # 1. Convert and calculate PTS immediately
         # MediaRelay requires consistent PTS to function correctly
@@ -349,12 +359,12 @@ class BGRArrayVideoStreamTrack(MediaStreamTrack):
             video_frame = av.VideoFrame.from_ndarray(bgr_numpy, format="bgr24")
             
             if self._start_time is None:
-                self._start_time = time.time()
+                self._start_time = time.monotonic()
                 self._pts = 0
             else:
                 # 90000 is the standard RTP clock rate for video
                 # This ensures smooth playback
-                self._pts = int((time.time() - self._start_time) * 90000)
+                self._pts = max(self._pts + 1, int((time.monotonic() - self._start_time) * 90000))
             
             video_frame.pts = self._pts
             video_frame.time_base = fractions.Fraction(1, 90000)
@@ -370,6 +380,10 @@ class BGRArrayVideoStreamTrack(MediaStreamTrack):
             
         def _put():
             try:
+                if metadata is not None:
+                    self._metadata_by_pts[video_frame.pts] = metadata
+                    while len(self._metadata_by_pts) > 128:
+                        self._metadata_by_pts.popitem(last=False)
                 # Drop old frame if queue is full (Low Latency strategy)
                 if self._queue.full():
                     self._queue.get_nowait()
@@ -462,12 +476,16 @@ class WebRTC_PublisherThread(threading.Thread):
         pc = RTCPeerConnection()
         self._pcs.add(pc)
 
-        # CORE LOGIC: Use MediaRelay to subscribe
-        # This ensures encoding happens only once globally
+        native_metadata = params.get("video_metadata") == CHANNEL_LABEL
+        # MediaRelay shares source frames; each peer still has its own encoder.
         if self._bgr_track and self._relay:
             try:
-                relayed_track = self._relay.subscribe(self._bgr_track)
+                relayed_track = self._relay.subscribe(self._bgr_track, buffered=not native_metadata)
                 transceiver = pc.addTransceiver(relayed_track, direction="sendonly")
+                if native_metadata:
+                    metadata_sender = VideoMetadataSender(
+                        transceiver.sender, self._bgr_track.metadata_for_pts, clock_id())
+                    pc.on("datachannel", metadata_sender.attach)
                 capabilities = RTCRtpSender.getCapabilities("video")
                 client_codec = params.get("codec")
                 pref = (client_codec or self._codec_pref or "h264").lower()
@@ -2008,6 +2026,7 @@ class GstStereoRtpCamera(BaseCamera):
         self._rtp_ports = (int(left_rtp_port), int(right_rtp_port))
         self._capture = StereoCapture(*self._rtp_ports)
         self._frame_timestamp = 0.0
+        self._source_epoch = str(uuid.uuid4())
         logger_mp.info(str(self))
 
     @classmethod
@@ -2046,13 +2065,20 @@ class GstStereoRtpCamera(BaseCamera):
         timestamp = min(frame[0] for frame in pair)
         if time.monotonic() - timestamp > MAX_FRAME_AGE:
             raise TimeoutError(f"[Teleimager] {self._cam_topic}: stereo frame became stale during image processing")
+        eye_ns = [int(frame[0] * 1e9) for frame in pair]
+        self._source_sequence += 1
+        metadata = {
+            "source_monotonic_ns": min(eye_ns), "source_sequence": self._source_sequence,
+            "clock_id": self._clock_id, "source_epoch": self._source_epoch,
+            "timestamp_kind": "pc2_rtp_decoded_receive",
+        }
         if self._enable_zmq:
-            eye_ns = [int(frame[0] * 1e9) for frame in pair]
-            self._write_timed_jpeg(_turbojpeg.encode(frame_data), min(eye_ns),
-                                   "pc2_rtp_decoded_receive", eye_monotonic_ns=eye_ns,
-                                   stereo_skew_ns=max(eye_ns) - min(eye_ns))
+            self._zmq_buffer.write(timestamp_jpeg(_turbojpeg.encode(frame_data), {
+                **metadata, "eye_monotonic_ns": eye_ns,
+                "stereo_skew_ns": max(eye_ns) - min(eye_ns),
+            }))
         if self._enable_webrtc:
-            self._webrtc_buffer.write(frame_data)
+            self._webrtc_buffer.write((frame_data, metadata))
         self._frame_timestamp = timestamp
         if not self._ready.is_set():
             self._ready.set()
@@ -2065,7 +2091,14 @@ class GstStereoRtpCamera(BaseCamera):
     def get_bgr_frame(self):
         if time.monotonic() - self._frame_timestamp > MAX_FRAME_AGE:
             return None
-        return super().get_bgr_frame()
+        sample = super().get_bgr_frame()
+        return sample[0] if sample is not None else None
+
+    def get_webrtc_sample(self):
+        sample = super().get_bgr_frame()
+        if sample is None or time.monotonic_ns() - sample[1]["source_monotonic_ns"] > MAX_FRAME_AGE * 1e9:
+            return None
+        return sample
 
     def release(self):
         self._capture.close()
@@ -2277,7 +2310,8 @@ class TeleImageServer:
                 if seq == seen_seq:
                     continue  # nothing new yet
                 seen_seq = seq
-                bgr_frame = camera.get_bgr_frame()
+                bgr_frame = (camera.get_webrtc_sample() if isinstance(camera, GstStereoRtpCamera)
+                             else camera.get_bgr_frame())
                 if bgr_frame is None:
                     logger_mp.info(f"[Teleimager] {cam_topic} returned no frame.")
                     self._stop_event.set()

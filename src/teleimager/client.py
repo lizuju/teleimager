@@ -232,8 +232,6 @@ class ZMQ_PublisherThread(threading.Thread):
         except Exception as e:
             logger_mp.error(f"[Teleimager] Failed to initialize publisher socket: {e}")
         finally:
-            if clock_socket is not None:
-                clock_socket.close()
             # Ensure socket is closed when thread exits
             if self._socket:
                 try:
@@ -587,6 +585,8 @@ class ZMQ_SubscriberThread(threading.Thread):
         except Exception as e:
             logger_mp.error(f"[Teleimager] Failed to initialize subscriber socket: {e}")
         finally:
+            if clock_socket is not None:
+                clock_socket.close()
             # Ensure socket is closed when thread exits
             if self._socket:
                 try:
