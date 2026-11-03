@@ -2219,6 +2219,8 @@ class TeleImageServer:
             for cam_topic, server_cfg in self._server_config["camera"].items():
                 if not server_cfg.get("enable_zmq", False) and not server_cfg.get("enable_webrtc", False):
                     continue
+                if server_cfg.get("external_publisher"):
+                    continue
 
                 cam_type = server_cfg.get("type", "uvc").lower()
                 if self._enable_isaacsim and cam_type!="isaacsim":
