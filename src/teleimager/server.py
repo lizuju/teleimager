@@ -407,6 +407,9 @@ class WebRTC_PublisherThread(threading.Thread):
         self._app = web.Application()
         self._runner: Optional[web.AppRunner] = None
         self._pcs = set()
+        self._native_peers = {}
+        self._native_pending = {}
+        self._peer_tracks = {}
         self._start_event = threading.Event()
         self._stop_event = threading.Event()
         self._frame_queue = queue.Queue(maxsize=1)
@@ -473,14 +476,21 @@ class WebRTC_PublisherThread(threading.Thread):
             offer_sdp = re.sub(r"a=end-of-candidates\s*\r?\n", "", offer_sdp)
         offer = RTCSessionDescription(sdp=offer_sdp, type=params["type"])
 
+        native_metadata = params.get("video_metadata") == CHANNEL_LABEL
+        client_id = params.get("native_client_id") if native_metadata else None
+        if client_id is not None and (not isinstance(client_id, str) or not 1 <= len(client_id) <= 128):
+            return self._error_response(400, "Invalid native client identity")
+        client_key = (request.remote, client_id) if client_id is not None else None
         pc = RTCPeerConnection()
         self._pcs.add(pc)
+        if client_key is not None:
+            self._native_pending[client_key] = pc
 
-        native_metadata = params.get("video_metadata") == CHANNEL_LABEL
         # MediaRelay shares source frames; each peer still has its own encoder.
         if self._bgr_track and self._relay:
             try:
                 relayed_track = self._relay.subscribe(self._bgr_track, buffered=not native_metadata)
+                self._peer_tracks[pc] = relayed_track
                 transceiver = pc.addTransceiver(relayed_track, direction="sendonly")
                 if native_metadata:
                     metadata_sender = VideoMetadataSender(
@@ -526,6 +536,19 @@ class WebRTC_PublisherThread(threading.Thread):
             await pc.setRemoteDescription(offer)
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
+            if client_key is not None:
+                if self._native_pending.get(client_key) is not pc:
+                    await self._cleanup_pc(pc)
+                    return self._error_response(409, "Native video offer superseded by a newer request")
+                previous = self._native_peers.get(client_key)
+                self._native_peers[client_key] = pc
+                self._native_pending.pop(client_key)
+                if previous is not None:
+                    await self._cleanup_pc(previous)
+                    logger_mp.info(f"[Teleimager] Replaced native video connection for port:{self._port}")
+        except asyncio.CancelledError:
+            await asyncio.shield(self._cleanup_pc(pc))
+            raise
         except Exception as e:
             # Malformed SDP (missing ICE ufrag/pwd) or codec negotiation failure
             # (e.g. client offers no codec compatible with our H264 preference).
@@ -533,6 +556,9 @@ class WebRTC_PublisherThread(threading.Thread):
             await self._cleanup_pc(pc)
             return self._error_response(400, f"Negotiation failed: {e}")
 
+        if client_key is not None and self._native_peers.get(client_key) is not pc:
+            await self._cleanup_pc(pc)
+            return self._error_response(409, "Native video offer superseded by a newer request")
         return web.Response(
             content_type="application/json",
             text=json.dumps({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}),
@@ -545,9 +571,18 @@ class WebRTC_PublisherThread(threading.Thread):
 
     async def _cleanup_pc(self, pc):
         self._pcs.discard(pc)
+        for peers in (self._native_peers, self._native_pending):
+            for key, value in list(peers.items()):
+                if value is pc:
+                    del peers[key]
+        track = self._peer_tracks.pop(pc, None)
+        if track is not None:
+            # A peer closed before RTP starts does not stop its relay subscription.
+            track.stop()
         try:
-            await pc.close()
-        except: pass
+            await asyncio.shield(pc.close())
+        except Exception:
+            pass
 
     def wait_for_start(self, timeout=1.0):
         return self._start_event.wait(timeout=timeout)
@@ -599,10 +634,7 @@ class WebRTC_PublisherThread(threading.Thread):
 
     async def _shutdown(self):
         for pc in list(self._pcs):
-            try:
-                await pc.close()
-            except Exception:
-                pass
+            await self._cleanup_pc(pc)
         self._pcs.clear()
         if self._runner is not None:
             try:
